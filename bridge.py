@@ -442,6 +442,14 @@ XHD_SPOKES_PER_REV = 1440
 XHD_ANGLE_MAX      = XHD_SPOKES_PER_REV * 8   # 11520 (exclusive)
 
 
+_XHD_RANGES_M = [232, 463, 926, 1389, 1852, 2778, 3704, 5556,
+                  7408, 11112, 14816, 22224, 29632, 44448, 66672, 88896]
+
+
+def _nearest_xhd_range(range_m: int) -> int:
+    return min(_XHD_RANGES_M, key=lambda r: abs(r - range_m))
+
+
 def _furuno_to_xhd_spoke(src_angle: int, src_spokes_per_rev: int,
                           src_samples: bytes, src_range_m: int) -> bytes:
     """Convert a mayara protobuf spoke to an xHD UDP packet.
@@ -466,14 +474,15 @@ def _furuno_to_xhd_spoke(src_angle: int, src_spokes_per_rev: int,
             j = round(i * n_src / SAMPLES_PER_SPOKE)
             samples[i] = src_samples[min(j, n_src - 1)]
 
-    # Use fixed xHD range — must match status stream
-    range_m = SPOKE_RANGE_M
+    # range_meters: nearest xHD table value (plotter uses this for UI range display)
+    # display_meters: actual Furuno range (plotter uses this to scale the image)
+    range_m   = _nearest_xhd_range(src_range_m) if src_range_m > 0 else SPOKE_RANGE_M
+    display_m = src_range_m if src_range_m > 0 else range_m
 
     pkt = bytearray(_SPOKE_HEADER) + samples
     struct.pack_into('<H', pkt, _ANGLE_OFFSET, xhd_angle)
-    # Patch range fields to match current range
-    struct.pack_into('<I', pkt, _RANGE_OFFSET, range_m)
-    struct.pack_into('<I', pkt, _RANGE_OFFSET + 4, round(range_m * 4167 / 3704))
+    struct.pack_into('<I', pkt, _RANGE_OFFSET,     range_m)
+    struct.pack_into('<I', pkt, _RANGE_OFFSET + 4, display_m)
     return bytes(pkt)
 
 
@@ -507,7 +516,8 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
     def ws_reader():
         while not stop.is_set():
             try:
-                with ws_sync.connect(MAYARA_URL, max_size=2**20) as ws:
+                with ws_sync.connect(MAYARA_URL, max_size=2**20,
+                                     ping_interval=None) as ws:
                     log.info("Connected to mayara: %s", MAYARA_URL)
                     while not stop.is_set():
                         try:
@@ -544,6 +554,13 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
         if spokes_per_rev is None:
             spokes_per_rev = 8192   # Furuno DRS: angles 0..8191
             log.info("Using spokes_per_rev=%d (Furuno DRS)", spokes_per_rev)
+
+        global _current_range_m
+        if spoke.range > 0:
+            nearest = _nearest_xhd_range(spoke.range)
+            if nearest != _current_range_m:
+                _current_range_m = nearest
+                log.info("Range updated: %dm (display %dm)", nearest, spoke.range)
 
         pkt = _furuno_to_xhd_spoke(
             src_angle=spoke.angle,
@@ -609,7 +626,7 @@ def _run_synthetic_spokes(sock_data: socket.socket, stop: threading.Event):
 def make_multicast_sender(local_ip: str, group: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                     socket.inet_aton(local_ip))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
@@ -652,9 +669,13 @@ def run_heartbeat(sock_cdm: socket.socket, stop: threading.Event, syc_group_id: 
 
 
 def run_status(sock_report: socket.socket, stop: threading.Event):
-    """Broadcast xHD status packets every second."""
-    pkts = build_status_packets(SPOKE_RANGE_M)
+    """Broadcast xHD status packets every second, tracking current range."""
+    last_range = None
+    pkts = []
     while not stop.is_set():
+        if _current_range_m != last_range:
+            pkts = build_status_packets(_current_range_m)
+            last_range = _current_range_m
         for pkt in pkts:
             try:
                 sock_report.send(pkt)
