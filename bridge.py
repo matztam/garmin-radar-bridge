@@ -432,37 +432,151 @@ def _make_spoke_pkt(angle_raw: int) -> bytes:
     return bytes(pkt)
 
 
+MAYARA_URL = "ws://172.16.254.150:6502/signalk/v2/api/vessels/self/radars/furfe07/spokes"
+
+# xHD: 1440 spokes/rev, angle step=8, range 0..11512
+XHD_SPOKES_PER_REV = 1440
+XHD_ANGLE_MAX      = XHD_SPOKES_PER_REV * 8   # 11520 (exclusive)
+
+
+def _furuno_to_xhd_spoke(src_angle: int, src_spokes_per_rev: int,
+                          src_samples: bytes, src_range_m: int) -> bytes:
+    """Convert a mayara protobuf spoke to an xHD UDP packet.
+
+    src_angle is in [0..src_spokes_per_rev), bow-relative (0=ahead).
+    xHD angle is in 1/8° units, [0..11512], also bow-relative.
+    Samples are resampled to SAMPLES_PER_SPOKE via nearest-neighbour.
+    """
+    # Map angle: src units → xHD units (0..11512)
+    xhd_angle = round(src_angle * XHD_ANGLE_MAX / src_spokes_per_rev) % XHD_ANGLE_MAX
+    xhd_angle = (xhd_angle // 8) * 8   # quantize to step=8
+
+    # Resample spoke data to SAMPLES_PER_SPOKE via nearest-neighbour
+    n_src = len(src_samples)
+    if n_src == 0:
+        samples = bytearray(SAMPLES_PER_SPOKE)
+    elif n_src == SAMPLES_PER_SPOKE:
+        samples = bytearray(src_samples)
+    else:
+        samples = bytearray(SAMPLES_PER_SPOKE)
+        for i in range(SAMPLES_PER_SPOKE):
+            j = round(i * n_src / SAMPLES_PER_SPOKE)
+            samples[i] = src_samples[min(j, n_src - 1)]
+
+    # Build xHD range to match what we report in status
+    range_m = SPOKE_RANGE_M   # keep fixed for now; TODO: track plotter range
+
+    pkt = bytearray(_SPOKE_HEADER) + samples
+    struct.pack_into('<H', pkt, _ANGLE_OFFSET, xhd_angle)
+    # Patch range fields to match current range
+    struct.pack_into('<I', pkt, _RANGE_OFFSET, range_m)
+    struct.pack_into('<I', pkt, _RANGE_OFFSET + 4, round(range_m * 4167 / 3704))
+    return bytes(pkt)
+
+
 def run_spokes(sock_data: socket.socket, stop: threading.Event):
-    """Replay real xHD spokes from pcap, patching angle to continue rotating."""
+    """Bridge Furuno spokes from mayara WebSocket → xHD multicast.
+
+    Falls back to synthetic test pattern if mayara is unavailable.
+    """
+    import importlib, sys, queue
+
+    # Try to import websockets; graceful fallback if missing
+    try:
+        import websockets.sync.client as ws_sync
+    except ImportError:
+        log.warning("websockets not installed — using synthetic spokes (pip install websockets)")
+        ws_sync = None
+
+    try:
+        import RadarMessage_pb2 as pb
+    except ImportError:
+        log.warning("RadarMessage_pb2 not found — using synthetic spokes")
+        pb = None
+
+    if ws_sync is None or pb is None:
+        _run_synthetic_spokes(sock_data, stop)
+        return
+
+    # Queue for passing spokes from WebSocket thread to sender loop
+    spoke_q: queue.Queue = queue.Queue(maxsize=512)
+
+    def ws_reader():
+        while not stop.is_set():
+            try:
+                with ws_sync.connect(MAYARA_URL, max_size=2**20) as ws:
+                    log.info("Connected to mayara: %s", MAYARA_URL)
+                    while not stop.is_set():
+                        try:
+                            raw = ws.recv(timeout=5.0)
+                        except TimeoutError:
+                            continue
+                        if not isinstance(raw, (bytes, bytearray)):
+                            continue
+                        msg = pb.RadarMessage()
+                        msg.ParseFromString(raw)
+                        for spoke in msg.spokes:
+                            if not stop.is_set():
+                                try:
+                                    spoke_q.put_nowait(spoke)
+                                except queue.Full:
+                                    pass   # drop oldest implicitly
+            except Exception as e:
+                if not stop.is_set():
+                    log.warning("mayara WS error: %s — reconnecting in 3s", e)
+                    stop.wait(3.0)
+
+    reader = threading.Thread(target=ws_reader, daemon=True, name="ws-reader")
+    reader.start()
+
+    spokes_per_rev = None
+    log.info("Waiting for mayara spokes…")
+
+    while not stop.is_set():
+        try:
+            spoke = spoke_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        if spokes_per_rev is None:
+            spokes_per_rev = 8192   # Furuno DRS: angles 0..8191
+            log.info("Using spokes_per_rev=%d (Furuno DRS)", spokes_per_rev)
+
+        pkt = _furuno_to_xhd_spoke(
+            src_angle=spoke.angle,
+            src_spokes_per_rev=spokes_per_rev,
+            src_samples=spoke.data,
+            src_range_m=spoke.range,
+        )
+        try:
+            sock_data.send(pkt)
+        except OSError as e:
+            log.warning("Spoke send failed: %s", e)
+        # Small inter-spoke gap to avoid flooding the plotter
+        time.sleep(0.0005)
+
+
+def _run_synthetic_spokes(sock_data: socket.socket, stop: threading.Event):
+    """Fallback: synthetic ring + heading mark when mayara is unavailable."""
     pcap = _load_pcap_spokes('/tmp/garmin_long.pcap')
     if not pcap:
-        log.error("No pcap found")
+        log.error("No pcap found and mayara unavailable — no spoke data")
         return
-    log.info("Replaying %d spokes from pcap (%.1fs), looping", len(pcap), pcap[-1][0] - pcap[0][0])
-    t0        = pcap[0][0]
-    rel_times = [ts - t0 for ts, _ in pcap]
-    duration  = rel_times[-1]
-    # xHD: 1440 spokes/rev, angle in 1/8° units → 0..11512 (step=8, max=1439×8).
-    # The pcap already contains exactly one revolution (angles 0..11512).
-    # Replay one revolution with angles patched to start at 0.
+
     real_angles = [struct.unpack_from('<H', p, 12)[0] for _, p in pcap]
     wrap_idxs   = [i for i in range(1, len(real_angles)) if real_angles[i] < real_angles[i-1]]
-    # Second cycle (idx wrap[0]..wrap[1]) is a complete revolution: angles 0..11512
     w0, w1      = wrap_idxs[0], wrap_idxs[1]
     one_rev     = pcap[w0:w1]
     t0_rev      = pcap[w0][0]
     one_times   = [ts - t0_rev for ts, _ in one_rev]
     rev_dur     = one_times[-1]
-    log.info("One revolution: %d spokes, %.2fs, looping with angles 0..11512",
-             len(one_rev), rev_dur)
+    log.info("Synthetic spokes: %d spokes/rev, %.2fs", len(one_rev), rev_dur)
 
-    # Build sample arrays: ring + heading mark
     ring_samples = bytearray(SAMPLES_PER_SPOKE)
     r = SAMPLES_PER_SPOKE // 4
     for j in range(r - 2, r + 3):
         if 0 <= j < SAMPLES_PER_SPOKE:
             ring_samples[j] = 0xff
-
     heading_samples = bytearray(SAMPLES_PER_SPOKE)
     for j in range(SAMPLES_PER_SPOKE):
         heading_samples[j] = 0xff
@@ -476,13 +590,10 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
             sleep  = target - time.monotonic()
             if sleep > 0.0005:
                 time.sleep(sleep)
-            angle = (i * 8) % 11520   # 0, 8, 16, ..., 11512
+            angle = (i * 8) % 11520
             pkt   = bytearray(payload)
             struct.pack_into('<H', pkt, 12, angle)
-            if angle < 200:
-                pkt[36:36 + SAMPLES_PER_SPOKE] = heading_samples
-            else:
-                pkt[36:36 + SAMPLES_PER_SPOKE] = ring_samples
+            pkt[36:36 + SAMPLES_PER_SPOKE] = heading_samples if angle < 200 else ring_samples
             try:
                 sock_data.send(bytes(pkt))
             except OSError as e:
