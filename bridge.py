@@ -88,45 +88,60 @@ def build_cdm_heartbeat(seq: int, syc_group_id: int = 6) -> bytes:
     return header + bytes(payload)
 
 
-# ── HD status report (msg 0x02A5) ────────────────────────────────────────────
+# ── HD state / settings packet layout (shared by 0x02A5 and 0x02A7) ─────────
 #
-# mayara process_hd_status reads the entire packet (header + payload) as `data`:
-#   data[0..4]   = msg_id  (GMN header)
-#   data[4..8]   = pay_len (GMN header)
-#   data[8..10]  = state (u16 LE)       3=standby, 4=transmit
-#   data[10..12] = warmup_secs (u16 LE)
-#   data[12..16] = range_meters (u32 LE, wire value = meters - 1)
-#   data[16]     = gain_level
-#   data[17]     = gain_mode (0=manual, 1=auto)
-#   data[18..20] = pad
-#   data[20]     = sea_clutter_level
-#   data[21]     = sea_clutter_mode
-#   data[22..24] = pad
-#   data[24]     = rain_clutter_level
-#   data[25..28] = pad
-#   data[28..30] = dome_offset (i16 LE, bearing alignment in degrees)
-#   data[30]     = pad
-#   data[31]     = crosstalk_onoff
-#   data[32..40] = pad
-#   data[40]     = dome_speed (scan_speed: 0=normal, 1=slow)
-#   data[41..56] = pad (to reach 48-byte payload minimum)
-# Total payload: 48 bytes, total packet: 56 bytes
+# From radar_pi GarminHDReceive.cpp rad_response_pkt struct:
+#   Byte offsets are from the start of the full GMN packet (header included).
+#
+#   [0..4]   msg_id      (GMN header)
+#   [4..8]   pay_len=40  (GMN header — payload only, NOT counting this header)
+#   [8..10]  scanner_state (u16 LE)  3=standby, 4=transmit
+#   [10..12] warmup (u16 LE)
+#   [12..16] range_meters (u32 LE, wire value = meters - 1)
+#   [16]     gain_level
+#   [17]     gain_mode (0=manual, 1=auto)
+#   [18..20] fill_1 (u16)
+#   [20]     sea_clutter_level
+#   [21]     sea_clutter_mode
+#   [22..24] fill_2 (u16)
+#   [24]     rain_clutter_level
+#   [25..28] fill_3[3]
+#   [28..30] dome_offset (i16 LE, bearing alignment in degrees)
+#   [30]     FTC_mode
+#   [31]     crosstalk_onoff
+#   [32..36] fill_4[2] (u16[2])
+#   [36]     timed_transmit_mode
+#   [37]     timed_transmit_transmit
+#   [38]     timed_transmit_standby
+#   [39]     fill_5
+#   [40]     dome_speed (scan_speed: 0=normal, 1=slow)
+#   [41..48] fill_6[7]
+# Total: 8-byte header + 40-byte payload = 48 bytes on the wire.
+
+_HD_PAYLOAD_SIZE = 40
+
+def _build_hd_payload(state: int, range_m: int) -> bytearray:
+    """Build the 40-byte payload common to 0x02A5 and 0x02A7."""
+    p = bytearray(_HD_PAYLOAD_SIZE)
+    struct.pack_into("<H", p, 0, state)           # scanner_state
+    struct.pack_into("<H", p, 2, 0)               # warmup
+    struct.pack_into("<I", p, 4, range_m - 1)     # range (meters − 1 on wire)
+    p[8]  = 50                                    # gain_level
+    p[9]  = 1                                     # gain_mode (1 = auto)
+    # p[12] = 0  sea_clutter_level (already 0)
+    # p[13] = 0  sea_clutter_mode  (already 0)
+    # p[16] = 0  rain_clutter_level (already 0)
+    struct.pack_into("<h", p, 20, 0)              # dome_offset (bearing align)
+    # p[22] = 0  FTC_mode          (already 0)
+    # p[23] = 0  crosstalk_onoff   (already 0)
+    # p[32] = 0  dome_speed        (already 0)
+    return p
+
 
 def build_hd_state(state: int = HD_STATE_STANDBY, range_m: int = 1852) -> bytes:
-    payload = bytearray(48)
-    struct.pack_into("<H", payload, 0, state)           # [0..2]  state
-    struct.pack_into("<H", payload, 2, 0)               # [2..4]  warmup_secs
-    struct.pack_into("<I", payload, 4, range_m - 1)     # [4..8]  range (meters - 1)
-    payload[8]  = 50                                    # gain_level
-    payload[9]  = 1                                     # gain_mode (auto)
-    payload[12] = 0                                     # sea_clutter_level
-    payload[13] = 0                                     # sea_clutter_mode
-    payload[16] = 0                                     # rain_clutter_level
-    struct.pack_into("<h", payload, 20, 0)              # dome_offset (bearing align)
-    payload[23] = 0                                     # crosstalk
-    payload[32] = 0                                     # dome_speed (scan speed)
-    header = GMN_HEADER.pack(MSG_HD_STATE, len(payload))
-    return header + bytes(payload)
+    p = _build_hd_payload(state, range_m)
+    header = GMN_HEADER.pack(MSG_HD_STATE, _HD_PAYLOAD_SIZE)
+    return header + bytes(p)
 
 
 # ── HD capability report (msg 0x02AE) ────────────────────────────────────────
@@ -233,21 +248,11 @@ def run_status(sock_report: socket.socket, stop: threading.Event):
         stop.wait(1.0)
 
 
-# HD settings report (msg 0x02A7) — ~88 bytes, sent in response to 0x02D3.
-# Layout from radar_pi garmin.cpp: composite settings block.
-# We send a minimal zeroed block with just state and range filled in.
-HD_SETTINGS_FMT = struct.Struct("<HHibbbbbbbbHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH")
-
 def build_hd_settings(state: int = HD_STATE_STANDBY, range_m: int = 1852) -> bytes:
-    range_dm = range_m * 10
-    # 44 u16/i32 fields — fill with zeros except state and range
-    fields = [0] * 44
-    fields[0] = state
-    fields[1] = 0          # warmup_secs
-    # range is i32 at offset 4 — pack separately
-    header  = GMN_HEADER.pack(MSG_HD_SETTINGS, 88)
-    payload = struct.pack("<HHi", state, 0, range_dm) + b'\x00' * 82
-    return header + payload[:88]
+    """Build a 0x02A7 settings report — same 40-byte layout as 0x02A5."""
+    p = _build_hd_payload(state, range_m)
+    header = GMN_HEADER.pack(MSG_HD_SETTINGS, _HD_PAYLOAD_SIZE)
+    return header + bytes(p)
 
 
 def run_command_listener(local_ip: str, stop: threading.Event):
