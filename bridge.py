@@ -163,7 +163,11 @@ def build_hd_capability() -> bytes:
 #   u8[8]   version string (ASCII, null-padded)
 
 def build_hd_scanner_id() -> bytes:
-    version = b"1.0     "   # 8 bytes
+    # product_id (2B) + software_version (8B ASCII null-padded)
+    # Version string must match what the plotter expects for GMR 18 HD.
+    # "4.00    " is a plausible live firmware version; "1.0     " may be
+    # rejected as too old / incompatible.
+    version = b"4.00    "   # 8 bytes
     payload = struct.pack("<H", PRODUCT_ID_GMR_18_HD) + version
     header  = GMN_HEADER.pack(MSG_HD_SCANNER_ID, len(payload))
     return header + payload
@@ -284,20 +288,20 @@ def run_command_listener(local_ip: str, sock_report: socket.socket, stop: thread
                     sock.sendto(build_hd_scanner_id(), addr)
                     log.debug("Replied scanner ID to %s", addr)
 
-                # 0x02D3 — request settings → reply with 0x02A7 + state reports
+                # 0x02D3 — request settings → reply with 0x02A7 + 0x02A5
                 elif msg_id == 0x02d3:
                     sock.sendto(build_hd_settings(), addr)
                     sock.sendto(build_hd_state(), addr)
-                    sock.sendto(build_hd_capability(), addr)
                     log.debug("Replied settings to %s", addr)
 
                 # 0x02EE — request settings report (CMD_HD_REQUEST_SETTINGS)
-                # Reply both unicast to plotter and on the report multicast stream.
+                # Reply with settings only — NOT scanner ID (0x02A6), since
+                # sending 0x02A6 after 0x02EE creates a feedback loop where
+                # each scanner-ID triggers another 0x02EE flood.
                 elif msg_id == 0x02ee:
-                    for pkt in (build_hd_settings(), build_hd_state(), build_hd_scanner_id()):
-                        sock.sendto(pkt, addr)
-                        sock_report.send(pkt)  # also on 239.254.2.0:50100
-                    log.debug("Replied settings (0x02ee) to %s + multicast", addr)
+                    sock.sendto(build_hd_settings(), addr)
+                    sock.sendto(build_hd_state(), addr)
+                    log.debug("Replied settings (0x02ee) to %s", addr)
 
                 else:
                     log.info("Unknown CMD %#06x from %s", msg_id, addr)
