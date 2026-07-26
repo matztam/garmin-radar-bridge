@@ -48,28 +48,37 @@ MSG_HD_ROTATION_SPEED = 0x02ab  # RPM × 100
 HD_STATE_STANDBY    = 3
 HD_STATE_TRANSMIT   = 4
 
-# Product IDs (from mayara discovery.rs / radar_pi)
-# 0x0154 = GMR 18 HD  0x0157 = GMR 24 HD
-PRODUCT_ID_GMR_18_HD = 0x0154
+# Product IDs (from mayara discovery.rs)
+PRODUCT_ID_GMR_18_HD = 0x01fd  # confirmed in mayara discovery.rs
+PRODUCT_ID_GMR_24_HD = 0x0195
 
 # ── CDM heartbeat (30 bytes) ──────────────────────────────────────────────────
 
-def build_cdm_heartbeat(seq: int, syc_group_id: int = 2) -> bytes:
-    """Build a 30-byte CDM V2 heartbeat packet (msg 0x038e)."""
-    payload = bytearray(22)
-    payload[0]    = 2                # version_marker
-    # payload[1]  = 0                # pad
-    struct.pack_into("<H", payload, 2, PRODUCT_ID_GMR_18_HD)
-    # payload[4]  = 0                # simulator_mode
-    payload[5]    = 5                # product_subtype
-    payload[6]    = syc_group_id
-    payload[7]    = 1                # constant
-    # payload[8]  = 0                # service_count
-    # payload[9..12] = pad
-    # payload[12..16] = service-section padding (firmware minimum)
-    payload[16]   = 0x01             # tail tag type
-    payload[17]   = 0x04             # tail tag length
-    struct.pack_into("<I", payload, 18, seq)
+def build_cdm_heartbeat(seq: int, syc_group_id: int = 6) -> bytes:
+    """Build a CDM V2 heartbeat packet (msg 0x038e) with one radar service.
+
+    Mirrors the layout captured from a real GMR xHD in mayara's test data:
+      [GMN header 8B][version+pad+product_id+sim+subtype+syc+const 8B]
+      [service_count 1B][pad 3B][service 8B][tail 6B]
+    Total: 8 + 8 + 1 + 3 + 8 + 6 = 34 bytes payload, 42 bytes total.
+    """
+    # 1 service entry: class=1 inst=0 ver=2 reserved=0 id=0x08d40aa0
+    # (service ID observed in mayara's captured xHD heartbeat)
+    service = struct.pack("<BBH", 1, 0, 2) + struct.pack("<I", 0x08d40aa0)
+
+    payload = bytearray()
+    payload += struct.pack("<B", 2)                     # version_marker
+    payload += b'\x00'                                  # pad
+    payload += struct.pack("<H", PRODUCT_ID_GMR_18_HD)  # product_id
+    payload += b'\x00'                                  # simulator_mode
+    payload += struct.pack("<B", 5)                     # product_subtype
+    payload += struct.pack("<B", syc_group_id)
+    payload += b'\x01'                                  # constant
+    payload += struct.pack("<B", 1)                     # service_count
+    payload += b'\x00\x00\x00'                          # pad
+    payload += service                                  # 8 bytes
+    payload += b'\x01\x04'                              # tail tag type+len
+    payload += struct.pack("<I", seq)                   # sequence
 
     header = GMN_HEADER.pack(MSG_CDM_HEARTBEAT, len(payload))
     return header + bytes(payload)
@@ -180,14 +189,14 @@ def _local_ips():
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def run_heartbeat(sock_cdm: socket.socket, stop: threading.Event):
+def run_heartbeat(sock_cdm: socket.socket, stop: threading.Event, syc_group_id: int = 6):
     """Send CDM heartbeat: 1 s for first 30 ticks, then 5 s."""
     seq = 0
     while not stop.is_set():
-        pkt = build_cdm_heartbeat(seq)
+        pkt = build_cdm_heartbeat(seq, syc_group_id)
         try:
             sock_cdm.send(pkt)
-            log.debug("CDM heartbeat seq=%d", seq)
+            log.debug("CDM heartbeat seq=%d syc_group_id=%d", seq, syc_group_id)
         except OSError as e:
             log.warning("CDM send failed: %s", e)
         seq += 1
