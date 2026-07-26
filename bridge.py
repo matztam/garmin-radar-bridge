@@ -434,6 +434,9 @@ def _make_spoke_pkt(angle_raw: int) -> bytes:
 
 MAYARA_URL = "ws://172.16.254.150:6502/signalk/v2/api/vessels/self/radars/furfe07/spokes"
 
+# Shared current range — updated by spoke thread, read by status thread
+_current_range_m = SPOKE_RANGE_M
+
 # xHD: 1440 spokes/rev, angle step=8, range 0..11512
 XHD_SPOKES_PER_REV = 1440
 XHD_ANGLE_MAX      = XHD_SPOKES_PER_REV * 8   # 11520 (exclusive)
@@ -463,8 +466,8 @@ def _furuno_to_xhd_spoke(src_angle: int, src_spokes_per_rev: int,
             j = round(i * n_src / SAMPLES_PER_SPOKE)
             samples[i] = src_samples[min(j, n_src - 1)]
 
-    # Build xHD range to match what we report in status
-    range_m = SPOKE_RANGE_M   # keep fixed for now; TODO: track plotter range
+    # Use fixed xHD range — must match status stream
+    range_m = SPOKE_RANGE_M
 
     pkt = bytearray(_SPOKE_HEADER) + samples
     struct.pack_into('<H', pkt, _ANGLE_OFFSET, xhd_angle)
@@ -499,7 +502,7 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
         return
 
     # Queue for passing spokes from WebSocket thread to sender loop
-    spoke_q: queue.Queue = queue.Queue(maxsize=512)
+    spoke_q: queue.Queue = queue.Queue(maxsize=8192)
 
     def ws_reader():
         while not stop.is_set():
@@ -552,8 +555,6 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
             sock_data.send(pkt)
         except OSError as e:
             log.warning("Spoke send failed: %s", e)
-        # Small inter-spoke gap to avoid flooding the plotter
-        time.sleep(0.0005)
 
 
 def _run_synthetic_spokes(sock_data: socket.socket, stop: threading.Event):
@@ -651,8 +652,8 @@ def run_heartbeat(sock_cdm: socket.socket, stop: threading.Event, syc_group_id: 
 
 
 def run_status(sock_report: socket.socket, stop: threading.Event):
-    """Broadcast xHD status packets every 5 seconds (minimal load)."""
-    pkts = build_status_packets()
+    """Broadcast xHD status packets every second."""
+    pkts = build_status_packets(SPOKE_RANGE_M)
     while not stop.is_set():
         for pkt in pkts:
             try:
