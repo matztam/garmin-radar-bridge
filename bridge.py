@@ -160,10 +160,14 @@ def build_hd_rotation_speed(rpm: int = 24) -> bytes:
 
 def make_multicast_sender(local_ip: str, group: str, port: int) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                     socket.inet_aton(local_ip))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    # Bind to the same port we send on — a real radar sends from port 50100
+    # on the report stream and port 50050 on the CDM heartbeat stream.
+    sock.bind((local_ip, port))
     sock.connect((group, port))
     return sock
 
