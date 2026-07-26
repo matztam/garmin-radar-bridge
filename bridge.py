@@ -45,6 +45,9 @@ MSG_HD_SCANNER_ID   = 0x02a6  # scanner identity / version
 MSG_HD_CAPABILITY   = 0x02ae  # capability report
 MSG_HD_ROTATION_SPEED = 0x02ab  # RPM × 100
 
+# HD settings composite report (msg 0x02A7) — sent in response to 0x02D3
+MSG_HD_SETTINGS     = 0x02a7
+
 # HD state codes (msg 0x02A5)
 HD_STATE_STANDBY    = 3
 HD_STATE_TRANSMIT   = 4
@@ -226,13 +229,25 @@ def run_status(sock_report: socket.socket, stop: threading.Event):
         stop.wait(1.0)
 
 
-def run_command_listener(local_ip: str, stop: threading.Event):
-    """Listen on UDP port 50101 for commands from the plotter and log them.
+# HD settings report (msg 0x02A7) — ~88 bytes, sent in response to 0x02D3.
+# Layout from radar_pi garmin.cpp: composite settings block.
+# We send a minimal zeroed block with just state and range filled in.
+HD_SETTINGS_FMT = struct.Struct("<HHibbbbbbbbHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH")
 
-    The plotter sends unicast commands to <radar_ip>:50101. We ack each
-    command by re-sending the current state reports so the plotter knows
-    we received it.
-    """
+def build_hd_settings(state: int = HD_STATE_STANDBY, range_m: int = 1852) -> bytes:
+    range_dm = range_m * 10
+    # 44 u16/i32 fields — fill with zeros except state and range
+    fields = [0] * 44
+    fields[0] = state
+    fields[1] = 0          # warmup_secs
+    # range is i32 at offset 4 — pack separately
+    header  = GMN_HEADER.pack(MSG_HD_SETTINGS, 88)
+    payload = struct.pack("<HHi", state, 0, range_dm) + b'\x00' * 82
+    return header + payload[:88]
+
+
+def run_command_listener(local_ip: str, stop: threading.Event):
+    """Listen on UDP port 50101 for commands from the plotter and respond."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((local_ip, COMMAND_PORT))
@@ -244,10 +259,24 @@ def run_command_listener(local_ip: str, stop: threading.Event):
             data, addr = sock.recvfrom(4096)
             if len(data) >= 8:
                 msg_id, pay_len = struct.unpack('<II', data[:8])
-                log.info("CMD from %s: msg=%#06x pay_len=%d raw=%s",
-                         addr, msg_id, pay_len, data.hex())
+                log.info("CMD from %s: msg=%#06x pay_len=%d", addr, msg_id, pay_len)
+
+                # 0x02D2 — request scanner ID → reply with 0x02A6
+                if msg_id == 0x02d2:
+                    sock.sendto(build_hd_scanner_id(), addr)
+                    log.debug("Replied scanner ID to %s", addr)
+
+                # 0x02D3 — request settings → reply with 0x02A7 + state reports
+                elif msg_id == 0x02d3:
+                    sock.sendto(build_hd_settings(), addr)
+                    sock.sendto(build_hd_state(), addr)
+                    sock.sendto(build_hd_capability(), addr)
+                    log.debug("Replied settings to %s", addr)
+
+                else:
+                    log.info("Unknown CMD %#06x from %s raw=%s", msg_id, addr, data.hex())
             else:
-                log.info("CMD from %s: raw=%s", addr, data.hex())
+                log.info("Short CMD from %s: raw=%s", addr, data.hex())
         except socket.timeout:
             continue
         except OSError as e:
