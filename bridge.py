@@ -31,6 +31,7 @@ CDM_HEARTBEAT_PORT  = 50050
 
 REPORT_GROUP = "239.254.2.0"
 REPORT_PORT  = 50100   # HD: both spokes AND status live here
+COMMAND_PORT = 50101   # unicast commands from plotter → radar
 
 # GMN header: [u32 LE msg_id][u32 LE payload_len]
 GMN_HEADER = struct.Struct("<II")
@@ -225,6 +226,35 @@ def run_status(sock_report: socket.socket, stop: threading.Event):
         stop.wait(1.0)
 
 
+def run_command_listener(local_ip: str, stop: threading.Event):
+    """Listen on UDP port 50101 for commands from the plotter and log them.
+
+    The plotter sends unicast commands to <radar_ip>:50101. We ack each
+    command by re-sending the current state reports so the plotter knows
+    we received it.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((local_ip, COMMAND_PORT))
+    sock.settimeout(1.0)
+    log.info("Listening for commands on %s:%d", local_ip, COMMAND_PORT)
+
+    while not stop.is_set():
+        try:
+            data, addr = sock.recvfrom(4096)
+            if len(data) >= 8:
+                msg_id, pay_len = struct.unpack('<II', data[:8])
+                log.info("CMD from %s: msg=%#06x pay_len=%d raw=%s",
+                         addr, msg_id, pay_len, data.hex())
+            else:
+                log.info("CMD from %s: raw=%s", addr, data.hex())
+        except socket.timeout:
+            continue
+        except OSError as e:
+            log.warning("Command listener error: %s", e)
+    sock.close()
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -249,8 +279,9 @@ def main():
 
     stop = threading.Event()
     threads = [
-        threading.Thread(target=run_heartbeat, args=(sock_cdm, stop),    daemon=True, name="cdm"),
-        threading.Thread(target=run_status,    args=(sock_report, stop),  daemon=True, name="status"),
+        threading.Thread(target=run_heartbeat,        args=(sock_cdm, stop),           daemon=True, name="cdm"),
+        threading.Thread(target=run_status,            args=(sock_report, stop),        daemon=True, name="status"),
+        threading.Thread(target=run_command_listener,  args=(local_ip, stop),           daemon=True, name="cmd"),
     ]
     for t in threads:
         t.start()
