@@ -90,39 +90,43 @@ def build_cdm_heartbeat(seq: int, syc_group_id: int = 6) -> bytes:
 
 # ── HD status report (msg 0x02A5) ────────────────────────────────────────────
 #
-# Layout from mayara report.rs + radar_pi garmin.cpp:
-#   u16 LE  state        (3=standby, 4=transmit)
-#   u16 LE  warmup_secs
-#   i32 LE  range_dm     (range in decimetres)
-#   u8      gain
-#   u8      gain_auto
-#   u8      sea
-#   u8      sea_auto
-#   u8      rain
-#   u8      rain_auto
-#   u8      crosstalk
-#   u8      scan_speed   (0=normal, 1=slow)
-# Total: 14 bytes
-
-HD_STATE_FMT = struct.Struct("<HHibbbbbbbb")
+# mayara process_hd_status reads the entire packet (header + payload) as `data`:
+#   data[0..4]   = msg_id  (GMN header)
+#   data[4..8]   = pay_len (GMN header)
+#   data[8..10]  = state (u16 LE)       3=standby, 4=transmit
+#   data[10..12] = warmup_secs (u16 LE)
+#   data[12..16] = range_meters (u32 LE, wire value = meters - 1)
+#   data[16]     = gain_level
+#   data[17]     = gain_mode (0=manual, 1=auto)
+#   data[18..20] = pad
+#   data[20]     = sea_clutter_level
+#   data[21]     = sea_clutter_mode
+#   data[22..24] = pad
+#   data[24]     = rain_clutter_level
+#   data[25..28] = pad
+#   data[28..30] = dome_offset (i16 LE, bearing alignment in degrees)
+#   data[30]     = pad
+#   data[31]     = crosstalk_onoff
+#   data[32..40] = pad
+#   data[40]     = dome_speed (scan_speed: 0=normal, 1=slow)
+#   data[41..56] = pad (to reach 48-byte payload minimum)
+# Total payload: 48 bytes, total packet: 56 bytes
 
 def build_hd_state(state: int = HD_STATE_STANDBY, range_m: int = 1852) -> bytes:
-    range_dm = range_m * 10
-    payload = HD_STATE_FMT.pack(
-        state,      # state
-        0,          # warmup_secs
-        range_dm,   # range in decimetres
-        50,         # gain
-        1,          # gain_auto
-        0,          # sea
-        0,          # sea_auto
-        0,          # rain
-        0,          # rain_auto
-        0,          # crosstalk
-        0,          # scan_speed
-    )
+    payload = bytearray(48)
+    struct.pack_into("<H", payload, 0, state)           # [0..2]  state
+    struct.pack_into("<H", payload, 2, 0)               # [2..4]  warmup_secs
+    struct.pack_into("<I", payload, 4, range_m - 1)     # [4..8]  range (meters - 1)
+    payload[8]  = 50                                    # gain_level
+    payload[9]  = 1                                     # gain_mode (auto)
+    payload[12] = 0                                     # sea_clutter_level
+    payload[13] = 0                                     # sea_clutter_mode
+    payload[16] = 0                                     # rain_clutter_level
+    struct.pack_into("<h", payload, 20, 0)              # dome_offset (bearing align)
+    payload[23] = 0                                     # crosstalk
+    payload[32] = 0                                     # dome_speed (scan speed)
     header = GMN_HEADER.pack(MSG_HD_STATE, len(payload))
-    return header + payload
+    return header + bytes(payload)
 
 
 # ── HD capability report (msg 0x02AE) ────────────────────────────────────────
@@ -272,6 +276,13 @@ def run_command_listener(local_ip: str, stop: threading.Event):
                     sock.sendto(build_hd_state(), addr)
                     sock.sendto(build_hd_capability(), addr)
                     log.debug("Replied settings to %s", addr)
+
+                # 0x02EE — request settings report (CMD_HD_REQUEST_SETTINGS)
+                elif msg_id == 0x02ee:
+                    sock.sendto(build_hd_settings(), addr)
+                    sock.sendto(build_hd_state(), addr)
+                    sock.sendto(build_hd_scanner_id(), addr)
+                    log.debug("Replied settings (0x02ee) to %s", addr)
 
                 else:
                     log.info("Unknown CMD %#06x from %s raw=%s", msg_id, addr, data.hex())
