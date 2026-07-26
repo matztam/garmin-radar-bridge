@@ -255,7 +255,7 @@ def build_hd_settings(state: int = HD_STATE_STANDBY, range_m: int = 1852) -> byt
     return header + bytes(p)
 
 
-def run_command_listener(local_ip: str, stop: threading.Event):
+def run_command_listener(local_ip: str, sock_report: socket.socket, stop: threading.Event):
     """Listen on UDP port 50101 for commands from the plotter and respond."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -263,12 +263,21 @@ def run_command_listener(local_ip: str, stop: threading.Event):
     sock.settimeout(1.0)
     log.info("Listening for commands on %s:%d", local_ip, COMMAND_PORT)
 
+    _ee_count = 0  # throttle 0x02EE logging
+
     while not stop.is_set():
         try:
             data, addr = sock.recvfrom(4096)
             if len(data) >= 8:
                 msg_id, pay_len = struct.unpack('<II', data[:8])
-                log.info("CMD from %s: msg=%#06x pay_len=%d", addr, msg_id, pay_len)
+
+                if msg_id == 0x02ee:
+                    _ee_count += 1
+                    if _ee_count <= 3 or _ee_count % 100 == 0:
+                        log.info("CMD 0x02ee from %s (count=%d)", addr, _ee_count)
+                else:
+                    log.info("CMD from %s: msg=%#06x pay_len=%d raw=%s",
+                             addr, msg_id, pay_len, data.hex())
 
                 # 0x02D2 — request scanner ID → reply with 0x02A6
                 if msg_id == 0x02d2:
@@ -283,14 +292,15 @@ def run_command_listener(local_ip: str, stop: threading.Event):
                     log.debug("Replied settings to %s", addr)
 
                 # 0x02EE — request settings report (CMD_HD_REQUEST_SETTINGS)
+                # Reply both unicast to plotter and on the report multicast stream.
                 elif msg_id == 0x02ee:
-                    sock.sendto(build_hd_settings(), addr)
-                    sock.sendto(build_hd_state(), addr)
-                    sock.sendto(build_hd_scanner_id(), addr)
-                    log.debug("Replied settings (0x02ee) to %s", addr)
+                    for pkt in (build_hd_settings(), build_hd_state(), build_hd_scanner_id()):
+                        sock.sendto(pkt, addr)
+                        sock_report.send(pkt)  # also on 239.254.2.0:50100
+                    log.debug("Replied settings (0x02ee) to %s + multicast", addr)
 
                 else:
-                    log.info("Unknown CMD %#06x from %s raw=%s", msg_id, addr, data.hex())
+                    log.info("Unknown CMD %#06x from %s", msg_id, addr)
             else:
                 log.info("Short CMD from %s: raw=%s", addr, data.hex())
         except socket.timeout:
@@ -326,7 +336,7 @@ def main():
     threads = [
         threading.Thread(target=run_heartbeat,        args=(sock_cdm, stop),           daemon=True, name="cdm"),
         threading.Thread(target=run_status,            args=(sock_report, stop),        daemon=True, name="status"),
-        threading.Thread(target=run_command_listener,  args=(local_ip, stop),           daemon=True, name="cmd"),
+        threading.Thread(target=run_command_listener,  args=(local_ip, sock_report, stop), daemon=True, name="cmd"),
     ]
     for t in threads:
         t.start()
