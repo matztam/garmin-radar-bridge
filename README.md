@@ -6,6 +6,7 @@ Bridges Furuno radar spoke data (via [mayara-server](https://github.com/MarineYa
 
 - [x] Step 1 — Virtual xHD radar discovered and displaying synthetic spoke data
 - [x] Step 2 — Real Furuno spoke data bridged from mayara-server, chart overlay correct
+- [x] Step 3 — Plotter controls (range, gain, sea/rain clutter, transmit) forwarded to Furuno via mayara
 
 ## Hardware setup
 
@@ -89,16 +90,42 @@ Broadcast every second. Contains ~40 individual packets covering all radar setti
 
 | Message | ID | Value |
 |---------|----|-------|
-| Scanner state | `0x0992` | 5 = TRANSMIT |
-| Transmit mode | `0x0919` | 1 = on |
+| Scanner state | `0x0992` | 5 = TRANSMIT, 3 = STANDBY |
+| Transmit mode | `0x0919` | 1 = on, 0 = off |
 | Range A | `0x091e` | current range in meters |
-| Gain mode | `0x0924` | 2 = auto |
-| Sea clutter | `0x0939` | 0 = off |
-| Rain clutter | `0x0933` | 0 = off |
+| Gain mode | `0x0924` | 0 = manual, 2 = auto |
+| Gain | `0x0925` | uint16, percent×100 |
+| Sea clutter mode | `0x0939` | 0 = off, 1 = manual, 2 = auto |
+| Sea clutter gain | `0x093a` | uint16, level×100 |
+| Rain clutter mode | `0x0933` | 0 = off, 1 = on |
+| Rain clutter gain | `0x0934` | uint16, level×100 |
 | Bearing alignment | `0x0930` | i32 LE, degrees×32 |
 | … | … | … |
 
+The bridge reads the initial state of all controls from mayara at startup so the plotter shows the correct values immediately.
+
 The range value in the status stream must always match `range_meters` in the spoke packets. A mismatch causes the plotter to crash or freeze.
+
+### Command handling (port 50101)
+
+The plotter sends unicast UDP commands to `<bridge_ip>:50101`. The bridge:
+
+1. Echoes the command back on the status stream so the plotter sees it confirmed
+2. Forwards it to mayara via REST `PUT /controls/{name}`
+
+| Command | Wire ID | Forwarded to mayara as |
+|---------|---------|------------------------|
+| Transmit on/off | `0x0919` | `PUT /controls/power` `{"value": "transmit"/"standby"}` |
+| Range | `0x091e` | `PUT /controls/range` `{"value": <meters>}` |
+| Gain mode | `0x0924` | `PUT /controls/gain` `{"auto": true/false}` |
+| Gain level | `0x0925` | `PUT /controls/gain` `{"auto": false, "value": <0-100>}` |
+| Sea clutter mode | `0x0939` | `PUT /controls/sea` `{"auto": true/false, "value": ...}` |
+| Sea clutter gain | `0x093a` | `PUT /controls/sea` `{"auto": false, "value": <0-100>}` |
+| Rain clutter off | `0x0933` val=0 | `PUT /controls/rain` `{"auto": true}` (Furuno has auto, Garmin does not) |
+| Rain clutter on | `0x0933` val=1 | `PUT /controls/rain` `{"auto": false, "value": 50}` |
+| Rain clutter gain | `0x0934` | `PUT /controls/rain` `{"auto": false, "value": <0-100>}` |
+
+**Range command quirk:** The Furuno's internal range steps differ from the xHD range table. `spoke.range` in the WebSocket stream carries the Furuno's internal display range, which is approximately 1.782× the xHD range set via mayara. The bridge converts back via this ratio to keep `_current_range_m` consistent with the status stream.
 
 ### Spoke format (msg `0x0998`, port 50102)
 

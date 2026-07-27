@@ -217,18 +217,22 @@ def _pkt_i32(msg_id: int, value: int) -> bytes:
 
 # ── Status broadcast packets ──────────────────────────────────────────────────
 
-def build_status_packets(range_m: int = 3704) -> list[bytes]:
+def build_status_packets(range_m: int = 3704, state: int = STATE_TRANSMIT,
+                         gain_mode: int = 2, gain: int = 5000,
+                         sea_mode: int = 0, sea_gain: int = 0,
+                         rain_mode: int = 0, rain_gain: int = 0) -> list[bytes]:
     """Return the full set of status packets broadcast each second.
 
     State is TRANSMIT (5) to make the plotter show the radar in Marine Network.
     Spoke data (0x0998) is sent separately on port 50102.
     """
+    transmitting = (state == STATE_TRANSMIT)
     return [
-        # Scanner state: TRANSMIT
-        _pkt_u8(MSG_SCANNER_STATE, STATE_TRANSMIT),
+        # Scanner state
+        _pkt_u8(MSG_SCANNER_STATE, state),
         _pkt_u32(MSG_STATE_CHANGE, 0),
-        _pkt_u8(MSG_TRANSMIT_MODE, 1),
-        _pkt_u8(MSG_TRANSMIT_MODE_CURRENT, 1),
+        _pkt_u8(MSG_TRANSMIT_MODE, 1 if transmitting else 0),
+        _pkt_u8(MSG_TRANSMIT_MODE_CURRENT, 1 if transmitting else 0),
         # Scan type
         _pkt_u8(MSG_SCAN_TYPE, 1),    # 1=single range
         _pkt_u8(MSG_SCAN_TYPE_B, 0),
@@ -238,16 +242,16 @@ def build_status_packets(range_m: int = 3704) -> list[bytes]:
         # Range A
         _pkt_u32(MSG_RANGE_A, range_m),
         _pkt_u32(MSG_RANGE_A_SEC, 926),  # secondary range (unused, 1/2 NM)
-        # Gain: auto
-        _pkt_u8(MSG_RANGE_A_GAIN_MODE, 2),
-        _pkt_u16(MSG_RANGE_A_GAIN, 5000),
-        # Sea clutter: off
-        _pkt_u8(MSG_RANGE_A_SEA_MODE, 0),
-        _pkt_u16(MSG_RANGE_A_SEA_GAIN, 0),
+        # Gain
+        _pkt_u8(MSG_RANGE_A_GAIN_MODE, gain_mode),
+        _pkt_u16(MSG_RANGE_A_GAIN, gain),
+        # Sea clutter
+        _pkt_u8(MSG_RANGE_A_SEA_MODE, sea_mode),
+        _pkt_u16(MSG_RANGE_A_SEA_GAIN, sea_gain),
         _pkt_u8(MSG_RANGE_A_SEA_STATE, 0),
-        # Rain clutter: off
-        _pkt_u8(MSG_RANGE_A_RAIN_MODE, 0),
-        _pkt_u16(MSG_RANGE_A_RAIN_GAIN, 0),
+        # Rain clutter
+        _pkt_u8(MSG_RANGE_A_RAIN_MODE, rain_mode),
+        _pkt_u16(MSG_RANGE_A_RAIN_GAIN, rain_gain),
         # Interference rejection: off
         _pkt_u8(MSG_DITHER_MODE, 0),
         _pkt_u8(MSG_NOISE_BLANKER, 0),
@@ -432,8 +436,16 @@ def _make_spoke_pkt(angle_raw: int) -> bytes:
 
 MAYARA_URL = "ws://172.16.254.150:6502/signalk/v2/api/vessels/self/radars/furfe07/spokes"
 
-# Shared current range — updated by spoke thread, read by status thread
-_current_range_m = SPOKE_RANGE_M
+# Shared state — updated by command/spoke threads, read by status thread
+_current_range_m    = SPOKE_RANGE_M
+_current_state      = STATE_TRANSMIT   # STATE_TRANSMIT or STATE_STANDBY
+_range_lock_until   = 0.0              # spoke thread won't update range before this time
+_current_gain_mode  = 2                # 0=manual, 2=auto
+_current_gain       = 5000             # uint16, percent×100
+_current_sea_mode   = 0                # 0=off, 1=manual, 2=auto
+_current_sea_gain   = 0
+_current_rain_mode  = 0                # 0=off, 1=on
+_current_rain_gain  = 0
 
 # xHD: 1440 spokes/rev, angle step=8, range 0..11512
 XHD_SPOKES_PER_REV = 1440
@@ -554,11 +566,14 @@ def run_spokes(sock_data: socket.socket, stop: threading.Event):
             log.info("Using spokes_per_rev=%d (Furuno DRS)", spokes_per_rev)
 
         global _current_range_m
-        if spoke.range > 0:
-            nearest = _nearest_xhd_range(spoke.range)
+        if spoke.range > 0 and time.monotonic() >= _range_lock_until:
+            # spoke.range is the Furuno's internal range (~1.782× the xHD value set).
+            # Map back to the nearest xHD range via the known ratio.
+            furuno_to_xhd = spoke.range / 1.7822
+            nearest = _nearest_xhd_range(round(furuno_to_xhd))
             if nearest != _current_range_m:
                 _current_range_m = nearest
-                log.info("Range updated: %dm (display %dm)", nearest, spoke.range)
+                log.info("Spoke range: furuno=%dm → xhd=%dm (accepted)", spoke.range, nearest)
 
         pkt = _furuno_to_xhd_spoke(
             src_angle=spoke.angle,
@@ -667,13 +682,20 @@ def run_heartbeat(sock_cdm: socket.socket, stop: threading.Event, syc_group_id: 
 
 
 def run_status(sock_report: socket.socket, stop: threading.Event):
-    """Broadcast xHD status packets every second, tracking current range."""
-    last_range = None
+    """Broadcast xHD status packets every second, tracking current state."""
+    last = None
     pkts = []
     while not stop.is_set():
-        if _current_range_m != last_range:
-            pkts = build_status_packets(_current_range_m)
-            last_range = _current_range_m
+        cur = (_current_range_m, _current_state, _current_gain_mode, _current_gain,
+               _current_sea_mode, _current_sea_gain, _current_rain_mode, _current_rain_gain)
+        if cur != last:
+            pkts = build_status_packets(
+                range_m=_current_range_m, state=_current_state,
+                gain_mode=_current_gain_mode, gain=_current_gain,
+                sea_mode=_current_sea_mode, sea_gain=_current_sea_gain,
+                rain_mode=_current_rain_mode, rain_gain=_current_rain_gain,
+            )
+            last = cur
         for pkt in pkts:
             try:
                 sock_report.send(pkt)
@@ -682,13 +704,87 @@ def run_status(sock_report: socket.socket, stop: threading.Event):
         stop.wait(1.0)
 
 
+MAYARA_BASE   = "http://172.16.254.150:6502/signalk/v2/api/vessels/self/radars/furfe07"
+MAYARA_CTRL   = MAYARA_BASE + "/controls"
+
+# Furuno supported ranges fetched once at startup; fallback to xHD table
+_furuno_ranges: list[int] = []
+
+
+def _fetch_furuno_ranges():
+    import urllib.request, json
+    global _current_gain_mode, _current_gain, _current_sea_mode, _current_sea_gain
+    global _current_rain_mode, _current_rain_gain
+    try:
+        with urllib.request.urlopen(f"{MAYARA_BASE}/capabilities", timeout=3) as r:
+            caps = json.loads(r.read())
+            _furuno_ranges.extend(caps.get("supportedRanges", []))
+            log.info("Furuno supported ranges: %s", _furuno_ranges)
+    except Exception as e:
+        log.warning("Could not fetch Furuno capabilities: %s", e)
+    try:
+        with urllib.request.urlopen(f"{MAYARA_CTRL}", timeout=3) as r:
+            ctrl = json.loads(r.read())
+            g = ctrl.get("gain", {})
+            _current_gain_mode = 2 if g.get("auto") else 0
+            _current_gain      = int(g.get("value", 100)) * 100
+            s = ctrl.get("sea", {})
+            _current_sea_mode  = 2 if s.get("auto") else (1 if s.get("value", 0) > 0 else 0)
+            _current_sea_gain  = int(s.get("value", 0)) * 100
+            rain = ctrl.get("rain", {})
+            _current_rain_mode = 0 if rain.get("value", 0) == 0 and not rain.get("auto") else 1
+            _current_rain_gain = int(rain.get("value", 0)) * 100
+            log.info("Initial state from mayara: gain_mode=%d gain=%d sea_mode=%d sea_gain=%d rain_mode=%d",
+                     _current_gain_mode, _current_gain, _current_sea_mode, _current_sea_gain, _current_rain_mode)
+    except Exception as e:
+        log.warning("Could not fetch Furuno controls: %s", e)
+
+
+def _nearest_furuno_range(range_m: int) -> int:
+    # mayara only accepts xHD table values; pick the largest that doesn't exceed
+    # the requested range so the Furuno doesn't jump to a wider view
+    smaller = [r for r in _XHD_RANGES_M if r <= range_m]
+    return max(smaller) if smaller else _XHD_RANGES_M[0]
+
+
+def _mayara_put(control: str, body: dict):
+    """Send a PUT to mayara's control API. Fire-and-forget in a daemon thread."""
+    import urllib.request, json
+    url  = f"{MAYARA_CTRL}/{control}"
+    # Remove None values
+    body = {k: v for k, v in body.items() if v is not None}
+    data = json.dumps(body).encode()
+    req  = urllib.request.Request(url, data=data, method="PUT",
+                                  headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=2)
+        log.info("mayara PUT %s %s OK", control, body)
+    except Exception as e:
+        log.warning("mayara PUT %s %s failed: %s", control, body, e)
+
+
+def _mayara_put_async(control: str, body: dict):
+    t = threading.Thread(target=_mayara_put, args=(control, body), daemon=True)
+    t.start()
+
+
 def run_command_listener(local_ip: str, sock_report: socket.socket, stop: threading.Event):
-    """Listen on UDP port 50101 for commands from the plotter and respond."""
+    """Listen on UDP port 50101 for commands from the plotter.
+
+    Each command is echoed back on the status stream (so the plotter sees
+    it was accepted) and forwarded to mayara via REST PUT.
+    """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((local_ip, COMMAND_PORT))
     sock.settimeout(1.0)
     log.info("Listening for commands on %s:%d", local_ip, COMMAND_PORT)
+
+    def echo(pkt):
+        try:
+            sock_report.send(pkt)
+        except OSError:
+            pass
 
     while not stop.is_set():
         try:
@@ -696,22 +792,82 @@ def run_command_listener(local_ip: str, sock_report: socket.socket, stop: thread
             if len(data) < 8:
                 continue
             msg_id, pay_len = struct.unpack('<II', data[:8])
+            payload = data[8:8 + pay_len]
             log.info("CMD from %s: msg=0x%04x pay_len=%d", addr, msg_id, pay_len)
 
-            # Most xHD commands: the plotter sends a value, we echo it back on the
-            # report stream so the plotter sees its command was accepted.
-            if msg_id == MSG_TRANSMIT_MODE:
-                val = data[8] if len(data) > 8 else 0
-                sock.sendto(_pkt_u8(MSG_TRANSMIT_MODE, val), addr)
-                sock.sendto(_pkt_u8(MSG_SCANNER_STATE,
-                                    STATE_TRANSMIT if val else STATE_STANDBY), addr)
-            elif msg_id == MSG_RANGE_A:
-                if len(data) >= 12:
-                    meters = struct.unpack("<I", data[8:12])[0]
-                    sock.sendto(_pkt_u32(MSG_RANGE_A, meters), addr)
+            if msg_id == MSG_TRANSMIT_MODE and len(payload) >= 1:
+                val = payload[0]
+                global _current_state
+                _current_state = STATE_TRANSMIT if val else STATE_STANDBY
+                echo(_pkt_u8(MSG_TRANSMIT_MODE, val))
+                echo(_pkt_u8(MSG_SCANNER_STATE, _current_state))
+                _mayara_put_async("power", {"value": "transmit" if val else "standby"})
+
+            elif msg_id == MSG_RANGE_A and len(payload) >= 4:
+                meters = struct.unpack("<I", payload[:4])[0]
+                global _current_range_m, _range_lock_until
+                xhd_range = _nearest_xhd_range(meters)
+                _current_range_m = xhd_range
+                _range_lock_until = time.monotonic() + 5.0
+                log.info("Range CMD: plotter=%dm → xhd=%dm → mayara=%dm", meters, xhd_range, xhd_range)
+                # Echo exact plotter value back so plotter sees its command confirmed
+                echo(_pkt_u32(MSG_RANGE_A, meters))
+                _mayara_put_async("range", {"value": xhd_range})
+
+            elif msg_id == MSG_RANGE_A_GAIN_MODE and len(payload) >= 1:
+                mode = payload[0]   # 0=manual, 2=auto
+                global _current_gain_mode
+                _current_gain_mode = mode
+                echo(_pkt_u8(MSG_RANGE_A_GAIN_MODE, mode))
+                _mayara_put_async("gain", {"auto": mode == 2})
+
+            elif msg_id == MSG_RANGE_A_GAIN and len(payload) >= 2:
+                raw = struct.unpack("<H", payload[:2])[0]
+                global _current_gain
+                _current_gain = raw
+                echo(_pkt_u16(MSG_RANGE_A_GAIN, raw))
+                _mayara_put_async("gain", {"auto": False, "value": raw // 100})
+
+            elif msg_id == MSG_RANGE_A_SEA_MODE and len(payload) >= 1:
+                mode = payload[0]   # 0=off, 1=manual, 2=auto
+                global _current_sea_mode
+                _current_sea_mode = mode
+                echo(_pkt_u8(MSG_RANGE_A_SEA_MODE, mode))
+                if mode == 0:
+                    _mayara_put_async("sea", {"auto": False, "value": 0})
+                elif mode == 2:
+                    _mayara_put_async("sea", {"auto": True})
+
+            elif msg_id == MSG_RANGE_A_SEA_GAIN and len(payload) >= 2:
+                raw = struct.unpack("<H", payload[:2])[0]
+                global _current_sea_gain
+                _current_sea_gain = raw
+                echo(_pkt_u16(MSG_RANGE_A_SEA_GAIN, raw))
+                _mayara_put_async("sea", {"auto": False, "value": raw // 100})
+
+            elif msg_id == MSG_RANGE_A_RAIN_MODE and len(payload) >= 1:
+                mode = payload[0]   # 0=off, 1=on
+                global _current_rain_mode
+                _current_rain_mode = mode
+                echo(_pkt_u8(MSG_RANGE_A_RAIN_MODE, mode))
+                if mode == 0:
+                    _mayara_put_async("rain", {"auto": True})
+                else:
+                    _mayara_put_async("rain", {"auto": False, "value": 50})
+
+            elif msg_id == MSG_RANGE_A_RAIN_GAIN and len(payload) >= 2:
+                raw = struct.unpack("<H", payload[:2])[0]
+                global _current_rain_gain
+                _current_rain_gain = raw
+                echo(_pkt_u16(MSG_RANGE_A_RAIN_GAIN, raw))
+                _mayara_put_async("rain", {"auto": False, "value": raw // 100})
+
+            elif msg_id == MSG_RPM_MODE and len(payload) >= 1:
+                val = payload[0]
+                echo(_pkt_u8(MSG_RPM_MODE, val))
+                # Furuno doesn't have RPM control — ignore silently
+
             else:
-                # For all other commands, just log — the status broadcast will
-                # keep the plotter in sync.
                 log.debug("Unhandled CMD 0x%04x", msg_id)
 
         except socket.timeout:
@@ -739,6 +895,7 @@ def main():
     log.info("Using local IP: %s", local_ip)
     log.info("CDM heartbeat  → %s:%d", CDM_HEARTBEAT_GROUP, CDM_HEARTBEAT_PORT)
     log.info("Status reports → %s:%d", REPORT_GROUP, REPORT_PORT)
+    _fetch_furuno_ranges()
 
     sock_cdm    = make_multicast_sender(local_ip, CDM_HEARTBEAT_GROUP, CDM_HEARTBEAT_PORT)
     sock_report = make_multicast_sender(local_ip, REPORT_GROUP, REPORT_PORT)
