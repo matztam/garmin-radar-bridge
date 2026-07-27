@@ -51,15 +51,9 @@ The plotter should show the radar as "Xmit On" in Marine Network within a few se
 
 ## Network notes
 
-All spoke data is sent via UDP multicast to `239.254.2.0:50102`. Multicast TTL is set to 1 so packets stay in the local network segment and do not reach routers or Wi-Fi clients.
+All spoke data is sent via UDP multicast to `239.254.2.0:50102`. Multicast TTL is set to 1 so packets stay in the local network segment and do not reach routers beyond the local switch.
 
-If the switch does not support **IGMP snooping**, multicast packets are flooded to all ports including Wi-Fi access points, which can saturate the wireless network (~6 Mbit/s of radar data). On a MikroTik router:
-
-```
-/interface bridge set [find name=bridge] igmp-snooping=yes
-```
-
-The Furuno radar itself also sends multicast on the same network. With IGMP snooping enabled, those packets only reach mayara-server and the bridge host, not Wi-Fi clients.
+The Furuno radar itself also sends multicast (to deliver spokes to mayara-server). If your switch does not perform IGMP snooping, all radar multicast is flooded to every port — including Wi-Fi access points — which can saturate the wireless network (~6 Mbit/s of radar data). Enable IGMP snooping on your switch to confine the traffic to the ports that actually need it.
 
 ---
 
@@ -158,12 +152,16 @@ The plotter only accepts ranges from this fixed table (in meters):
 
 ### Spoke angle
 
+The xHD protocol uses **1/8° units** for angles, bow-relative (0 = straight ahead). One full revolution spans 0..11519, but valid spoke angles are **0..11512** in steps of 8 — giving exactly 1440 unique spoke positions per revolution (11520 / 8 = 1440). Angles above 11512 crash the plotter immediately.
+
 The Furuno DRS sends 8192 spokes per revolution, with angles 0..8191 (bow-relative). The conversion to xHD angle units:
 
 ```python
 xhd_angle = round(src_angle * 11520 / 8192) % 11520
 xhd_angle = (xhd_angle // 8) * 8   # quantize to step=8
 ```
+
+Because the Furuno has more spokes per revolution (8192) than the xHD supports (1440), multiple Furuno spokes map to the same xHD angle. The plotter receives more updates per position than a real xHD would send, but this is harmless — the plotter simply overwrites the previous value for that angle.
 
 ### Sample resampling
 
@@ -222,5 +220,4 @@ message Spoke {
 
 - [MarineYachtRadar/mayara-server](https://github.com/MarineYachtRadar/mayara-server) — Rust radar server, Garmin xHD protocol implementation and documentation
 - [douwefokkema/radar_pi](https://github.com/douwefokkema/radar_pi) — OpenCPN plugin, `GarminxHDReceive.cpp` defines `struct radar_line`
-- Garmin xHD pcap from the radar_pi repository (`garmin_xhd.pcap.gz`) — used for protocol verification
-- Garmin developer documentation (garmin.zip, covers xHD and Fantom Pro protocols)
+- Garmin xHD packet captures — used for protocol verification and deriving exact field values
