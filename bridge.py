@@ -1,16 +1,14 @@
 """
-garmin-radar-bridge — GMR xHD emulator
+garmin-radar-bridge — Furuno → Garmin xHD bridge
 
-Emulates a Garmin GMR xHD radar on the local network so that a Garmin plotter
-discovers a "virtual radar" without any real spoke data (Step 1).  Once the
-plotter shows the radar as usable, Step 2 will bridge Furuno spoke data from
-mayara-server into the xHD spoke stream.
+Emulates a Garmin GMR xHD radar on the local network so that a Garmin GPSMAP
+chartplotter discovers and displays real Furuno radar data from mayara-server.
 
-Protocol: enhanced (0x09xx message IDs), product_id=0x06d0 (GMR xHD).
+Protocol: xHD enhanced (0x09xx message IDs), product_id=0x06d0 (GMR xHD).
 Discovery: CDM heartbeat (0x038e) + capability bitmap (0x09B1) + range table (0x09B2).
-Status stream: 239.254.2.0:50100 — settings broadcast ~1/s each.
-Spoke stream:  239.254.2.0:50102 — (Step 2, not yet implemented).
-Commands:      unicast UDP to <radar_ip>:50101.
+Status stream: 239.254.2.0:50100 — settings broadcast every second.
+Spoke stream:  239.254.2.0:50102 — xHD spoke packets (0x0998), one per Furuno spoke.
+Commands:      unicast UDP from plotter to <radar_ip>:50101.
 
 Run as root (or with CAP_NET_ADMIN) so multicast sockets can bind.
 
